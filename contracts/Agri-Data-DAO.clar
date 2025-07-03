@@ -8,6 +8,9 @@
 (define-constant ERR_VOTING_ENDED (err u106))
 (define-constant ERR_INVALID_PROPOSAL (err u107))
 (define-constant ERR_NOT_MEMBER (err u108))
+(define-constant ERR_NOT_PURCHASER (err u109))
+(define-constant ERR_ALREADY_RATED (err u110))
+(define-constant ERR_INVALID_RATING (err u111))
 
 (define-data-var next-data-id uint u1)
 (define-data-var next-proposal-id uint u1)
@@ -242,4 +245,85 @@
         data-info (some (get price data-info))
         none
     )
+)
+
+
+(define-map data-ratings uint {
+    total-ratings: uint,
+    total-score: uint,
+    average-rating: uint
+})
+
+(define-map user-ratings {data-id: uint, rater: principal} uint)
+
+(define-public (rate-data (data-id uint) (rating uint))
+    (begin
+        (asserts! (is-some (map-get? sensor-data data-id)) ERR_DATA_NOT_FOUND)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+        (asserts! (get sold (unwrap-panic (map-get? sensor-data data-id))) ERR_DATA_NOT_FOUND)
+        (asserts! (is-eq tx-sender (unwrap-panic (get buyer (unwrap-panic (map-get? sensor-data data-id))))) ERR_NOT_PURCHASER)
+        (asserts! (is-none (map-get? user-ratings {data-id: data-id, rater: tx-sender})) ERR_ALREADY_RATED)
+        (map-set user-ratings {data-id: data-id, rater: tx-sender} rating)
+        (let ((current-ratings (default-to {total-ratings: u0, total-score: u0, average-rating: u0} 
+                                          (map-get? data-ratings data-id))))
+            (let ((new-total-ratings (+ (get total-ratings current-ratings) u1))
+                  (new-total-score (+ (get total-score current-ratings) rating)))
+                (map-set data-ratings data-id {
+                    total-ratings: new-total-ratings,
+                    total-score: new-total-score,
+                    average-rating: (/ (* new-total-score u100) new-total-ratings)
+                })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-data-rating (data-id uint))
+    (map-get? data-ratings data-id)
+)
+
+(define-read-only (get-farmer-average-rating (farmer principal))
+    (let ((farmer-info (map-get? farmers farmer)))
+        (match farmer-info
+            info (if (> (get data-count info) u0)
+                    (let ((score (get-farmer-quality-score farmer (get data-count info))))
+                        (some (/ (get total-score score) (get count score))))
+                    (some u0))
+            none
+        )
+    )
+)
+
+(define-read-only (get-farmer-quality-score (farmer principal) (data-count uint))
+    (fold calculate-farmer-rating (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+          {farmer: farmer, total-score: u0, count: u0, max-check: data-count})
+)
+
+(define-private (calculate-farmer-rating (data-id uint) (acc {farmer: principal, total-score: uint, count: uint, max-check: uint}))
+    (if (>= (get count acc) (get max-check acc))
+        acc
+        (match (map-get? sensor-data data-id)
+            data-info (if (and (is-eq (get farmer data-info) (get farmer acc))
+                              (get sold data-info))
+                         (match (map-get? data-ratings data-id)
+                             rating-info {
+                                 farmer: (get farmer acc),
+                                 total-score: (+ (get total-score acc) (get average-rating rating-info)),
+                                 count: (+ (get count acc) u1),
+                                 max-check: (get max-check acc)
+                             }
+                             acc)
+                         acc)
+            acc
+        )
+    )
+)
+
+(define-read-only (has-rated-data (data-id uint) (rater principal))
+    (is-some (map-get? user-ratings {data-id: data-id, rater: rater}))
+)
+
+(define-read-only (get-user-rating (data-id uint) (rater principal))
+    (map-get? user-ratings {data-id: data-id, rater: rater})
 )
