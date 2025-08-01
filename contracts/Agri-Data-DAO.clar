@@ -12,6 +12,12 @@
 (define-constant ERR_ALREADY_RATED (err u110))
 (define-constant ERR_INVALID_RATING (err u111))
 
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u112))
+(define-constant ERR_SUBSCRIPTION_EXPIRED (err u113))
+(define-constant ERR_INSUFFICIENT_SUBSCRIPTION_BALANCE (err u114))
+
+(define-data-var next-subscription-id uint u1)
+
 (define-data-var next-data-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var treasury-balance uint u0)
@@ -326,4 +332,83 @@
 
 (define-read-only (get-user-rating (data-id uint) (rater principal))
     (map-get? user-ratings {data-id: data-id, rater: rater})
+)
+
+(define-map subscriptions uint {
+    subscriber: principal,
+    farmer: principal,
+    data-type: (string-ascii 50),
+    monthly-fee: uint,
+    balance: uint,
+    expires-at: uint,
+    auto-renew: bool,
+    created-at: uint
+})
+
+(define-map farmer-subscribers {farmer: principal, subscriber: principal} uint)
+
+(define-public (create-subscription (farmer principal) (data-type (string-ascii 50)) (monthly-fee uint) (initial-payment uint))
+    (begin
+        (asserts! (is-some (map-get? farmers farmer)) ERR_NOT_MEMBER)
+        (asserts! (> monthly-fee u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= initial-payment monthly-fee) ERR_INSUFFICIENT_BALANCE)
+        (try! (stx-transfer? initial-payment tx-sender (as-contract tx-sender)))
+        (let ((subscription-id (var-get next-subscription-id)))
+            (map-set subscriptions subscription-id {
+                subscriber: tx-sender,
+                farmer: farmer,
+                data-type: data-type,
+                monthly-fee: monthly-fee,
+                balance: initial-payment,
+                expires-at: (+ stacks-block-height u4320),
+                auto-renew: true,
+                created-at: stacks-block-height
+            })
+            (map-set farmer-subscribers {farmer: farmer, subscriber: tx-sender} subscription-id)
+            (var-set next-subscription-id (+ subscription-id u1))
+            (ok subscription-id)
+        )
+    )
+)
+
+(define-public (access-subscribed-data (subscription-id uint) (data-id uint))
+    (begin
+        (asserts! (is-some (map-get? subscriptions subscription-id)) ERR_SUBSCRIPTION_NOT_FOUND)
+        (asserts! (is-some (map-get? sensor-data data-id)) ERR_DATA_NOT_FOUND)
+        (let ((subscription (unwrap-panic (map-get? subscriptions subscription-id)))
+              (data (unwrap-panic (map-get? sensor-data data-id))))
+            (asserts! (is-eq tx-sender (get subscriber subscription)) ERR_NOT_AUTHORIZED)
+            (asserts! (< stacks-block-height (get expires-at subscription)) ERR_SUBSCRIPTION_EXPIRED)
+            (asserts! (is-eq (get farmer data) (get farmer subscription)) ERR_NOT_AUTHORIZED)
+            (asserts! (is-eq (get data-type data) (get data-type subscription)) ERR_INVALID_PROPOSAL)
+            (ok true)
+        )
+    )
+)
+
+(define-public (renew-subscription (subscription-id uint) (payment uint))
+    (begin
+        (asserts! (is-some (map-get? subscriptions subscription-id)) ERR_SUBSCRIPTION_NOT_FOUND)
+        (let ((subscription (unwrap-panic (map-get? subscriptions subscription-id))))
+            (asserts! (is-eq tx-sender (get subscriber subscription)) ERR_NOT_AUTHORIZED)
+            (asserts! (>= payment (get monthly-fee subscription)) ERR_INSUFFICIENT_BALANCE)
+            (try! (stx-transfer? payment tx-sender (as-contract tx-sender)))
+            (map-set subscriptions subscription-id (merge subscription {
+                balance: (+ (get balance subscription) payment),
+                expires-at: (+ (get expires-at subscription) u4320)
+            }))
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+    (map-get? subscriptions subscription-id)
+)
+
+(define-read-only (is-subscription-active (subscription-id uint))
+    (match (map-get? subscriptions subscription-id)
+        subscription (< stacks-block-height (get expires-at subscription))
+        false
+    )
 )
