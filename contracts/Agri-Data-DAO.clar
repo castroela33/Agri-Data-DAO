@@ -16,6 +16,14 @@
 (define-constant ERR_SUBSCRIPTION_EXPIRED (err u113))
 (define-constant ERR_INSUFFICIENT_SUBSCRIPTION_BALANCE (err u114))
 
+(define-constant ERR_INSURANCE_NOT_FOUND (err u115))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u116))
+(define-constant ERR_INSURANCE_EXPIRED (err u117))
+(define-constant ERR_INSUFFICIENT_INSURANCE_BALANCE (err u118))
+
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var next-policy-id uint u1)
+
 (define-data-var next-subscription-id uint u1)
 
 (define-data-var next-data-id uint u1)
@@ -411,4 +419,88 @@
         subscription (< stacks-block-height (get expires-at subscription))
         false
     )
+)
+
+
+(define-map insurance-policies uint {
+    buyer: principal,
+    data-id: uint,
+    premium-paid: uint,
+    coverage-amount: uint,
+    expires-at: uint,
+    claim-processed: bool
+})
+
+(define-map insurance-claims uint {
+    policy-id: uint,
+    claimed-at: uint,
+    claim-amount: uint,
+    approved: bool
+})
+
+(define-public (purchase-data-with-insurance (data-id uint))
+    (begin
+        (asserts! (is-some (map-get? sensor-data data-id)) ERR_DATA_NOT_FOUND)
+        (asserts! (not (get sold (unwrap-panic (map-get? sensor-data data-id)))) ERR_DATA_NOT_FOUND)
+        (let ((data-price (get price (unwrap-panic (map-get? sensor-data data-id))))
+              (farmer-rep (get-farmer-reputation (get farmer (unwrap-panic (map-get? sensor-data data-id)))))
+              (premium-rate (if (>= farmer-rep u10) u5 u10)))
+            (let ((insurance-premium (/ (* data-price premium-rate) u100))
+                  (total-cost (+ data-price insurance-premium))
+                  (policy-id (var-get next-policy-id)))
+                (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+                (try! (as-contract (stx-transfer? 
+                    (/ (* data-price u80) u100) 
+                    tx-sender 
+                    (get farmer (unwrap-panic (map-get? sensor-data data-id)))
+                )))
+                (var-set treasury-balance (+ (var-get treasury-balance) 
+                    (/ (* data-price u20) u100)
+                ))
+                (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) insurance-premium))
+                (map-set insurance-policies policy-id {
+                    buyer: tx-sender,
+                    data-id: data-id,
+                    premium-paid: insurance-premium,
+                    coverage-amount: data-price,
+                    expires-at: (+ stacks-block-height u2160),
+                    claim-processed: false
+                })
+                (map-set sensor-data data-id (merge 
+                    (unwrap-panic (map-get? sensor-data data-id))
+                    {sold: true, buyer: (some tx-sender)}
+                ))
+                (var-set next-policy-id (+ policy-id u1))
+                (ok policy-id)
+            )
+        )
+    )
+)
+
+(define-public (claim-insurance (policy-id uint))
+    (begin
+        (asserts! (is-some (map-get? insurance-policies policy-id)) ERR_INSURANCE_NOT_FOUND)
+        (let ((policy (unwrap-panic (map-get? insurance-policies policy-id))))
+            (asserts! (is-eq tx-sender (get buyer policy)) ERR_NOT_AUTHORIZED)
+            (asserts! (< stacks-block-height (get expires-at policy)) ERR_INSURANCE_EXPIRED)
+            (asserts! (not (get claim-processed policy)) ERR_CLAIM_ALREADY_PROCESSED)
+            (asserts! (>= (var-get insurance-pool-balance) (get coverage-amount policy)) ERR_INSUFFICIENT_INSURANCE_BALANCE)
+            (try! (as-contract (stx-transfer? 
+                (get coverage-amount policy) 
+                tx-sender 
+                (get buyer policy)
+            )))
+            (var-set insurance-pool-balance (- (var-get insurance-pool-balance) (get coverage-amount policy)))
+            (map-set insurance-policies policy-id (merge policy {claim-processed: true}))
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-insurance-policy (policy-id uint))
+    (map-get? insurance-policies policy-id)
+)
+
+(define-read-only (get-insurance-pool-balance)
+    (var-get insurance-pool-balance)
 )
