@@ -21,6 +21,13 @@
 (define-constant ERR_INSURANCE_EXPIRED (err u117))
 (define-constant ERR_INSUFFICIENT_INSURANCE_BALANCE (err u118))
 
+(define-constant ERR_BOUNTY_NOT_FOUND (err u119))
+(define-constant ERR_BOUNTY_EXPIRED (err u120))
+(define-constant ERR_ALREADY_CHALLENGED (err u121))
+(define-constant ERR_BOUNTY_ALREADY_RESOLVED (err u122))
+
+(define-data-var next-bounty-id uint u1)
+
 (define-data-var insurance-pool-balance uint u0)
 (define-data-var next-policy-id uint u1)
 
@@ -503,4 +510,91 @@
 
 (define-read-only (get-insurance-pool-balance)
     (var-get insurance-pool-balance)
+)
+
+
+(define-map quality-bounties uint {
+    data-id: uint,
+    poster: principal,
+    bounty-amount: uint,
+    expires-at: uint,
+    challenged: bool,
+    challenger: (optional principal),
+    resolved: bool,
+    data-valid: bool
+})
+
+(define-map bounty-challenges {bounty-id: uint, challenger: principal} bool)
+
+(define-public (create-quality-bounty (data-id uint) (bounty-amount uint))
+    (begin
+        (asserts! (is-some (map-get? sensor-data data-id)) ERR_DATA_NOT_FOUND)
+        (asserts! (get sold (unwrap-panic (map-get? sensor-data data-id))) ERR_DATA_NOT_FOUND)
+        (asserts! (is-eq tx-sender (unwrap-panic (get buyer (unwrap-panic (map-get? sensor-data data-id))))) ERR_NOT_PURCHASER)
+        (asserts! (> bounty-amount u0) ERR_INVALID_AMOUNT)
+        (try! (stx-transfer? bounty-amount tx-sender (as-contract tx-sender)))
+        (let ((bounty-id (var-get next-bounty-id)))
+            (map-set quality-bounties bounty-id {
+                data-id: data-id,
+                poster: tx-sender,
+                bounty-amount: bounty-amount,
+                expires-at: (+ stacks-block-height u1440),
+                challenged: false,
+                challenger: none,
+                resolved: false,
+                data-valid: true
+            })
+            (var-set next-bounty-id (+ bounty-id u1))
+            (ok bounty-id)
+        )
+    )
+)
+
+(define-public (challenge-data-quality (bounty-id uint))
+    (begin
+        (asserts! (is-some (map-get? quality-bounties bounty-id)) ERR_BOUNTY_NOT_FOUND)
+        (asserts! (is-some (map-get? farmers tx-sender)) ERR_NOT_MEMBER)
+        (let ((bounty (unwrap-panic (map-get? quality-bounties bounty-id))))
+            (asserts! (< stacks-block-height (get expires-at bounty)) ERR_BOUNTY_EXPIRED)
+            (asserts! (not (get challenged bounty)) ERR_ALREADY_CHALLENGED)
+            (asserts! (>= (get reputation (unwrap-panic (map-get? farmers tx-sender))) u3) ERR_NOT_AUTHORIZED)
+            (map-set quality-bounties bounty-id (merge bounty {
+                challenged: true,
+                challenger: (some tx-sender)
+            }))
+            (map-set bounty-challenges {bounty-id: bounty-id, challenger: tx-sender} true)
+            (ok true)
+        )
+    )
+)
+
+(define-public (resolve-bounty (bounty-id uint) (data-is-valid bool))
+    (begin
+        (asserts! (is-some (map-get? quality-bounties bounty-id)) ERR_BOUNTY_NOT_FOUND)
+        (let ((bounty (unwrap-panic (map-get? quality-bounties bounty-id))))
+            (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+            (asserts! (get challenged bounty) ERR_INVALID_PROPOSAL)
+            (asserts! (not (get resolved bounty)) ERR_BOUNTY_ALREADY_RESOLVED)
+            (if data-is-valid
+                (try! (as-contract (stx-transfer? (get bounty-amount bounty) tx-sender (get poster bounty))))
+                (try! (as-contract (stx-transfer? (get bounty-amount bounty) tx-sender (unwrap-panic (get challenger bounty)))))
+            )
+            (map-set quality-bounties bounty-id (merge bounty {
+                resolved: true,
+                data-valid: data-is-valid
+            }))
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-bounty (bounty-id uint))
+    (map-get? quality-bounties bounty-id)
+)
+
+(define-read-only (is-bounty-active (bounty-id uint))
+    (match (map-get? quality-bounties bounty-id)
+        bounty (and (< stacks-block-height (get expires-at bounty)) (not (get resolved bounty)))
+        false
+    )
 )
