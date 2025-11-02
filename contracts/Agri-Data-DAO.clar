@@ -26,6 +26,12 @@
 (define-constant ERR_ALREADY_CHALLENGED (err u121))
 (define-constant ERR_BOUNTY_ALREADY_RESOLVED (err u122))
 
+(define-constant ERR_LICENSE_NOT_FOUND (err u123))
+(define-constant ERR_LICENSE_EXHAUSTED (err u124))
+(define-constant ERR_INVALID_LICENSE_TYPE (err u125))
+
+(define-data-var next-license-id uint u1)
+
 (define-data-var next-bounty-id uint u1)
 
 (define-data-var insurance-pool-balance uint u0)
@@ -596,5 +602,95 @@
     (match (map-get? quality-bounties bounty-id)
         bounty (and (< stacks-block-height (get expires-at bounty)) (not (get resolved bounty)))
         false
+    )
+)
+
+(define-map data-licenses uint {
+    data-id: uint,
+    farmer: principal,
+    license-type: (string-ascii 20),
+    price-per-access: uint,
+    total-accesses: uint,
+    remaining-accesses: uint,
+    created-at: uint,
+    total-revenue: uint
+})
+
+(define-map license-purchases {license-id: uint, buyer: principal} {
+    accesses-bought: uint,
+    accesses-used: uint,
+    total-paid: uint,
+    last-access: uint
+})
+
+(define-map data-license-lookup {data-id: uint} uint)
+
+(define-public (create-data-license (data-id uint) (license-type (string-ascii 20)) (price-per-access uint) (max-accesses uint))
+    (begin
+        (asserts! (is-some (map-get? sensor-data data-id)) ERR_DATA_NOT_FOUND)
+        (asserts! (is-eq tx-sender (get farmer (unwrap-panic (map-get? sensor-data data-id)))) ERR_NOT_AUTHORIZED)
+        (asserts! (> price-per-access u0) ERR_INVALID_AMOUNT)
+        (asserts! (> max-accesses u0) ERR_INVALID_AMOUNT)
+        (let ((license-id (var-get next-license-id)))
+            (map-set data-licenses license-id {
+                data-id: data-id,
+                farmer: tx-sender,
+                license-type: license-type,
+                price-per-access: price-per-access,
+                total-accesses: max-accesses,
+                remaining-accesses: max-accesses,
+                created-at: stacks-block-height,
+                total-revenue: u0
+            })
+            (map-set data-license-lookup {data-id: data-id} license-id)
+            (var-set next-license-id (+ license-id u1))
+            (ok license-id)
+        )
+    )
+)
+
+(define-public (purchase-license-access (license-id uint) (num-accesses uint))
+    (begin
+        (asserts! (is-some (map-get? data-licenses license-id)) ERR_LICENSE_NOT_FOUND)
+        (asserts! (> num-accesses u0) ERR_INVALID_AMOUNT)
+        (let ((license (unwrap-panic (map-get? data-licenses license-id))))
+            (asserts! (>= (get remaining-accesses license) num-accesses) ERR_LICENSE_EXHAUSTED)
+            (let ((total-cost (* (get price-per-access license) num-accesses))
+                  (farmer-share (/ (* total-cost u90) u100))
+                  (dao-share (/ (* total-cost u10) u100)))
+                (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+                (try! (as-contract (stx-transfer? farmer-share tx-sender (get farmer license))))
+                (var-set treasury-balance (+ (var-get treasury-balance) dao-share))
+                (map-set data-licenses license-id (merge license {
+                    remaining-accesses: (- (get remaining-accesses license) num-accesses),
+                    total-revenue: (+ (get total-revenue license) total-cost)
+                }))
+                (let ((current-purchase (default-to {accesses-bought: u0, accesses-used: u0, total-paid: u0, last-access: u0}
+                                                    (map-get? license-purchases {license-id: license-id, buyer: tx-sender}))))
+                    (map-set license-purchases {license-id: license-id, buyer: tx-sender} {
+                        accesses-bought: (+ (get accesses-bought current-purchase) num-accesses),
+                        accesses-used: (get accesses-used current-purchase),
+                        total-paid: (+ (get total-paid current-purchase) total-cost),
+                        last-access: stacks-block-height
+                    })
+                )
+                (ok num-accesses)
+            )
+        )
+    )
+)
+
+(define-read-only (get-data-license (license-id uint))
+    (map-get? data-licenses license-id)
+)
+
+(define-read-only (get-license-purchase (license-id uint) (buyer principal))
+    (map-get? license-purchases {license-id: license-id, buyer: buyer})
+)
+
+(define-read-only (get-license-by-data-id (data-id uint))
+    (match (map-get? data-license-lookup {data-id: data-id})
+        license-id (map-get? data-licenses license-id)
+        none
     )
 )
